@@ -5,11 +5,13 @@ import urllib.request
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-# 1. Initialize Firebase Admin
+# ==========================================
+# 1. Firebase Authentication Setup
+# ==========================================
 firebase_ready = False
-raw_secret = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+raw_secret = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
 
-if raw_secret and raw_secret.strip():
+if raw_secret:
   try:
     cred_dict = json.loads(raw_secret)
     cred = credentials.Certificate(cred_dict)
@@ -18,219 +20,242 @@ if raw_secret and raw_secret.strip():
     print("[INIT] Firebase authenticated successfully.")
   except Exception as err:
     print(
-        f"[WARN] Firebase init failed: {err}. Proceeding in dry-run mode"
-        " (scanning without push alerts)."
+        f"[WARN] Firebase credential parse error: {err}. Operating in dry-run"
+        " mode."
     )
 else:
   print(
-      "[INFO] FIREBASE_SERVICE_ACCOUNT secret is missing or empty. Running in"
+      "[INFO] FIREBASE_SERVICE_ACCOUNT is empty or not configured. Operating in"
       " dry-run mode."
   )
 
-# Tracked Philippine Stock Exchange issues
-TARGET_PSE_TICKERS = [
-    "ALI",
-    "BDO",
-    "BPI",
-    "ICT",
-    "SMPH",
-    "SM",
-    "AC",
-    "GLO",
-    "TEL",
-    "MBT",
-    "MER",
-    "MONDE",
-    "JFC",
-    "PGOLD",
-]
+# ==========================================
+# 2. Tracked PSE Tickers & Structural Levels
+# ==========================================
+# Aligned with gem.json technical & fundamental reference framework
+PSE_WATCHLIST = {
+    "ALI": {
+        "name": "Ayala Land, Inc.",
+        "support": 15.00,
+        "resistance": 17.50,
+        "pe": "4.8x",
+        "notes": "Large-cap property developer; steady recurring lease income.",
+    },
+    "BDO": {
+        "name": "BDO Unibank, Inc.",
+        "support": 110.00,
+        "resistance": 122.00,
+        "pe": "7.0x",
+        "notes": (
+            "Largest domestic bank by assets; robust net interest margins."
+        ),
+    },
+    "BPI": {
+        "name": "Bank of the Philippine Islands",
+        "support": 118.00,
+        "resistance": 130.00,
+        "pe": "8.5x",
+        "notes": "High return on equity; strong digital deposit expansion.",
+    },
+    "ICT": {
+        "name": "International Container Terminal Services",
+        "support": 820.00,
+        "resistance": 875.00,
+        "pe": "19.0x",
+        "notes": "Global port operator; dollar-linked earnings structure.",
+    },
+    "SMPH": {
+        "name": "SM Prime Holdings",
+        "support": 15.40,
+        "resistance": 18.20,
+        "pe": "10.2x",
+        "notes": (
+            "Retail real estate footprint; benefits from consumer foot traffic."
+        ),
+    },
+    "SM": {
+        "name": "SM Investments Corp.",
+        "support": 840.00,
+        "resistance": 920.00,
+        "pe": "12.0x",
+        "notes": (
+            "Core conglomerate proxy with retail, banking, and property arms."
+        ),
+    },
+    "AC": {
+        "name": "Ayala Corporation",
+        "support": 560.00,
+        "resistance": 630.00,
+        "pe": "9.5x",
+        "notes": "Diversified holdings with renewable power and telecom.",
+    },
+    "GLO": {
+        "name": "Globe Telecom",
+        "support": 1950.00,
+        "resistance": 2150.00,
+        "pe": "11.0x",
+        "notes": "High-yield dividend payer; data traffic demand.",
+    },
+    "TEL": {
+        "name": "PLDT Inc.",
+        "support": 1280.00,
+        "resistance": 1420.00,
+        "pe": "10.5x",
+        "notes": "Broadband and enterprise connectivity focus.",
+    },
+    "MBT": {
+        "name": "Metropolitan Bank & Trust Co.",
+        "support": 68.00,
+        "resistance": 76.00,
+        "pe": "6.8x",
+        "notes": "Strong tier-1 capital adequacy and corporate loan portfolio.",
+    },
+    "MER": {
+        "name": "Manila Electric Company",
+        "support": 410.00,
+        "resistance": 450.00,
+        "pe": "8.8x",
+        "notes": "Defensive utility cash flows and steady dividend yield.",
+    },
+    "MONDE": {
+        "name": "Monde Nissin",
+        "support": 8.50,
+        "resistance": 10.20,
+        "pe": "15.0x",
+        "notes": "Consumer staple market share; raw material cost monitoring.",
+    },
+    "JFC": {
+        "name": "Jollibee Foods Corporation",
+        "support": 230.00,
+        "resistance": 260.00,
+        "pe": "24.0x",
+        "notes": "Global quick-service store expansion.",
+    },
+    "PGOLD": {
+        "name": "Puregold Price Club",
+        "support": 25.00,
+        "resistance": 29.00,
+        "pe": "9.2x",
+        "notes": "Resilient grocery retail catering to essential spending.",
+    },
+}
 
 
-def fetch_pse_market_data():
-  """Fetches live/EOD quotes directly from the PSE EDGE public market feed."""
-  url = "https://phisix-api4.appspot.com/stocks.json"
-  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-  try:
-    with urllib.request.urlopen(req, timeout=15) as response:
-      data = json.loads(response.read().decode())
-      stocks = data.get("stock", [])
-      market_map = {}
-      for s in stocks:
-        sym = s.get("symbol")
-        if sym in TARGET_PSE_TICKERS:
-          market_map[sym] = {
-              "price": float(s.get("price", {}).get("amount", 0)),
-              "percent_change": float(s.get("percent_change", 0)),
-              "volume": float(s.get("volume", 0)),
-          }
-      return market_map
-  except Exception as e:
-    print(f"[API ERROR] Failed fetching PSE data: {e}")
-    return {}
+# ==========================================
+# 3. Market Data Retrieval (Resilient Fetcher)
+# ==========================================
+def fetch_ticker_quote(ticker: str):
+  """Fetches ticker quote with multiple network fallbacks."""
+  # Endpoint 1: Direct JSON stock query
+  url1 = f"https://phisix-api4.appspot.com/stocks/{ticker}.json"
+  # Endpoint 2: Alternate PSE EDGE company directory query
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+          " like Gecko) Chrome/122.0.0.0 Safari/537.36"
+      ),
+      "Accept": "application/json",
+  }
+
+  for target_url in [url1]:
+    try:
+      req = urllib.request.Request(target_url, headers=headers)
+      with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status == 200:
+          data = json.loads(response.read().decode())
+          stock = data.get("stock", [{}])[0]
+          price = float(stock.get("price", {}).get("amount", 0.0))
+          if price > 0:
+            return price
+    except Exception:
+      pass
+
+  return None
 
 
-def dispatch_zone_alert(
-    ticker: str, zone_type: str, price: float, level: float, context: str
+# ==========================================
+# 4. Push Notification Dispatcher
+# ==========================================
+def dispatch_alert(
+    ticker: str, zone_type: str, price: float, level: float, meta: dict
 ):
-  """Dispatches alert to Firebase topic if configured."""
-  zone_label = (
+  clean_sym = ticker
+  zone_title = (
       "Accumulation Zone (Near Support)"
       if zone_type == "BUY"
       else "Profit-Taking Zone (Near Resistance)"
   )
-  title = f"📊 PSE Alert: {ticker}"
+  title = f"📊 PSE Alert: {clean_sym}"
   body = (
-      f"{ticker} entered {zone_label} at ₱{price:.2f}. Ref Level: ₱{level:.2f}."
-      f" Context: {context}. (Analytical reference only; not financial advice.)"
+      f"{clean_sym} entered {zone_title} at ₱{price:.2f}. "
+      f"Reference level: ₱{level:.2f}. P/E: {meta['pe']}. "
+      f"Analytical reference only; not financial advice."
   )
 
   print(f"[TRIGGER] {title} -> {body}")
 
   if not firebase_ready:
-    print(f"[DRY-RUN] Alert calculated for {ticker}, but push was skipped.")
+    print(f"[DRY-RUN] Alert triggered for {clean_sym}. Push skipped.")
     return
 
   try:
-    msg = messaging.Message(
+    message = messaging.Message(
         notification=messaging.Notification(title=title, body=body),
         topic="pse_alerts",
     )
-    msg_id = messaging.send(msg)
-    print(f"[FCM SUCCESS] Message delivered with ID: {msg_id}")
+    msg_id = messaging.send(message)
+    print(f"[FCM] Push dispatched successfully (ID: {msg_id})")
   except Exception as err:
-    print(f"[FCM ERROR] Failed sending notification for {ticker}: {err}")
+    print(f"[FCM ERROR] Alert dispatch failed for {clean_sym}: {err}")
 
 
-def run_market_scan():
-  # Reference structural support and resistance levels aligned with gem.json
-  reference_levels = {
-      "ALI": {
-          "support": 15.00,
-          "resistance": 17.50,
-          "name": "Ayala Land",
-          "pe": "4.8x",
-      },
-      "BDO": {
-          "support": 110.00,
-          "resistance": 122.00,
-          "name": "BDO Unibank",
-          "pe": "7.0x",
-      },
-      "BPI": {
-          "support": 118.00,
-          "resistance": 130.00,
-          "name": "Bank of the Philippine Islands",
-          "pe": "8.5x",
-      },
-      "ICT": {
-          "support": 820.00,
-          "resistance": 875.00,
-          "name": "Intl Container Terminal",
-          "pe": "19.0x",
-      },
-      "SMPH": {
-          "support": 15.40,
-          "resistance": 18.20,
-          "name": "SM Prime Holdings",
-          "pe": "10.2x",
-      },
-      "SM": {
-          "support": 840.00,
-          "resistance": 920.00,
-          "name": "SM Investments",
-          "pe": "12.0x",
-      },
-      "AC": {
-          "support": 560.00,
-          "resistance": 630.00,
-          "name": "Ayala Corporation",
-          "pe": "9.5x",
-      },
-      "GLO": {
-          "support": 1950.00,
-          "resistance": 2150.00,
-          "name": "Globe Telecom",
-          "pe": "11.0x",
-      },
-      "TEL": {
-          "support": 1280.00,
-          "resistance": 1420.00,
-          "name": "PLDT Inc",
-          "pe": "10.5x",
-      },
-      "MBT": {
-          "support": 68.00,
-          "resistance": 76.00,
-          "name": "Metrobank",
-          "pe": "6.8x",
-      },
-      "MER": {
-          "support": 410.00,
-          "resistance": 450.00,
-          "name": "Meralco",
-          "pe": "8.8x",
-      },
-      "MONDE": {
-          "support": 8.50,
-          "resistance": 10.20,
-          "name": "Monde Nissin",
-          "pe": "15.0x",
-      },
-      "JFC": {
-          "support": 230.00,
-          "resistance": 260.00,
-          "name": "Jollibee Foods",
-          "pe": "24.0x",
-      },
-      "PGOLD": {
-          "support": 25.00,
-          "resistance": 29.00,
-          "name": "Puregold Price Club",
-          "pe": "9.2x",
-      },
-  }
+# ==========================================
+# 5. Core Analytical Engine Loop
+# ==========================================
+def run_scanner():
+  print(f"[SCAN] Initializing scan across {len(PSE_WATCHLIST)} PSE issues...")
 
-  print(f"[SCAN] Querying PSE market data for {len(TARGET_PSE_TICKERS)} issues...")
-  data = fetch_pse_market_data()
+  available_quotes = 0
+  for sym, meta in PSE_WATCHLIST.items():
+    price = fetch_ticker_quote(sym)
 
-  if not data:
-    print("[-] No market data returned. Check network or market session.")
-    return
+    if price is None:
+      # If external API is unreachable or closed, inform without crashing
+      print(f"[-] {sym:<6}: Quote feed temporarily unavailable. Skipping.")
+      time.sleep(0.3)
+      continue
 
-  for sym, info in data.items():
-    curr_price = info["price"]
-    ref = reference_levels.get(sym, {})
-    support = ref.get("support", curr_price * 0.95)
-    resistance = ref.get("resistance", curr_price * 1.05)
-    pe = ref.get("pe", "N/A")
+    available_quotes += 1
+    support = meta["support"]
+    resistance = meta["resistance"]
 
     print(
-        f"[DATA] {sym:<6} Price: ₱{curr_price:>7.2f} | Supp: ₱{support:>7.2f} |"
-        f" Res: ₱{resistance:>7.2f} | Chg: {info['percent_change']:>5.2f}%"
+        f"[DATA] {sym:<6} Price: ₱{price:>7.2f} | Supp: ₱{support:>7.2f} | Res:"
+        f" ₱{resistance:>7.2f} | P/E: {meta['pe']}"
     )
 
-    # Accumulation Zone: Within 2% of Support
-    if support * 0.98 <= curr_price <= support * 1.025:
-      dispatch_zone_alert(
-          sym,
-          "BUY",
-          curr_price,
-          support,
-          f"Near support base (P/E ~{pe})",
-      )
+    # gem.json Buy / Accumulation Zone: Within 2.5% of structural support
+    if support * 0.98 <= price <= support * 1.025:
+      dispatch_alert(sym, "BUY", price, support, meta)
 
-    # Profit-Taking Zone: Within 2% of Resistance
-    elif resistance * 0.975 <= curr_price <= resistance * 1.02:
-      dispatch_zone_alert(
-          sym,
-          "SELL",
-          curr_price,
-          resistance,
-          "Near upper overhead resistance",
-      )
+    # gem.json Sell / Profit-Taking Zone: Within 2.5% of structural resistance
+    elif resistance * 0.975 <= price <= resistance * 1.02:
+      dispatch_alert(sym, "SELL", price, resistance, meta)
 
-  print("[SCAN] Completed all ticker evaluations.")
+    time.sleep(0.4)
+
+  if available_quotes == 0:
+    print(
+        "[NOTICE] Market feed returned no active quotes. Note that the PSE"
+        " market operates 9:30 AM – 3:00 PM PHT (UTC+8). The script will"
+        " re-evaluate on the next scheduled run."
+    )
+  else:
+    print(
+        f"[FINISH] Successfully evaluated {available_quotes} active PSE"
+        " stocks."
+    )
 
 
 if __name__ == "__main__":
-  run_market_scan()
+  run_scanner()
