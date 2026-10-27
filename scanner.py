@@ -10,7 +10,7 @@ import yfinance as yf
 firebase_ready = False
 raw_secret = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
-if raw_secret:
+if raw_secret and raw_secret.strip():
   try:
     cred_dict = json.loads(raw_secret)
     cred = credentials.Certificate(cred_dict)
@@ -27,22 +27,22 @@ else:
       "[INFO] No FIREBASE_SERVICE_ACCOUNT secret detected. Running dry-run scan."
   )
 
-# Core Philippine Stock Exchange issues
+# Correct Yahoo Finance suffix for Philippine Stock Exchange is .PM
 PSE_TICKERS = [
-    "ALI.PS",
-    "BDO.PS",
-    "BPI.PS",
-    "ICT.PS",
-    "SMPH.PS",
-    "SM.PS",
-    "AC.PS",
-    "GLO.PS",
-    "TEL.PS",
-    "MBT.PS",
-    "MER.PS",
-    "MONDE.PS",
-    "JFC.PS",
-    "PGOLD.PS",
+    "ALI.PM",
+    "BDO.PM",
+    "BPI.PM",
+    "ICT.PM",
+    "SMPH.PM",
+    "SM.PM",
+    "AC.PM",
+    "GLO.PM",
+    "TEL.PM",
+    "MBT.PM",
+    "MER.PM",
+    "MONDE.PM",
+    "JFC.PM",
+    "PGOLD.PM",
 ]
 
 
@@ -61,7 +61,7 @@ def dispatch_zone_alert(
     ticker: str, zone_type: str, price: float, level: float, rsi: float
 ):
   """Dispatches alert to Firebase topic if configured."""
-  clean_sym = ticker.replace(".PS", "")
+  clean_sym = ticker.replace(".PM", "")
   zone_label = (
       "Accumulation Zone (Near Support)"
       if zone_type == "BUY"
@@ -118,20 +118,21 @@ def run_market_scan():
       support_level = float(df["Low"].tail(20).min())
       resist_level = float(df["High"].tail(20).max())
 
+      clean_name = symbol.replace(".PM", "")
       print(
-          f"[DATA] {symbol.replace('.PS',''):<6} Price: ₱{curr_price:>7.2f} | "
-          f"Supp: ₱{support_level:>7.2f} | Res: ₱{resist_level:>7.2f} | "
-          f"RSI: {curr_rsi:>5.1f}"
+          f"[DATA] {clean_name:<6} Price: ₱{curr_price:>7.2f} | Supp:"
+          f" ₱{support_level:>7.2f} | Res: ₱{resist_level:>7.2f} | RSI:"
+          f" {curr_rsi:>5.1f}"
       )
 
-      # Buy/Accumulation Zone: Within 2% of Support and RSI <= 45
+      # Buy / Accumulation Zone: Near Support & RSI <= 45
       if (
           support_level * 0.98 <= curr_price <= support_level * 1.02
           and curr_rsi <= 45
       ):
         dispatch_zone_alert(symbol, "BUY", curr_price, support_level, curr_rsi)
 
-      # Sell/Profit-Taking Zone: Within 2% of Resistance and RSI >= 65
+      # Sell / Profit-Taking Zone: Near Resistance & RSI >= 65
       elif (
           resist_level * 0.98 <= curr_price <= resist_level * 1.02
           and curr_rsi >= 65
