@@ -3,33 +3,31 @@ import os
 import time
 import firebase_admin
 from firebase_admin import credentials, messaging
-import pandas_ta as ta
+import pandas as pd
 import yfinance as yf
 
-# 1. Gracefully initialize Firebase
+# 1. Initialize Firebase Admin
 firebase_ready = False
-firebase_creds_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+raw_secret = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
 
-if firebase_creds_json:
+if raw_secret:
   try:
-    cred_dict = json.loads(firebase_creds_json)
+    cred_dict = json.loads(raw_secret)
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
     firebase_ready = True
-    print("[INIT] Firebase Admin initialized successfully.")
-  except Exception as e:
-    print(f"[WARN] Failed to initialize Firebase: {e}")
+    print("[INIT] Firebase authenticated successfully.")
+  except Exception as err:
     print(
-        "[WARN] Continuing execution in dry-run mode (analysis only,"
-        " notifications skipped)."
+        f"[WARN] Firebase init failed: {err}. Proceeding in dry-run mode"
+        " (scanning without push alerts)."
     )
 else:
   print(
-      "[WARN] FIREBASE_SERVICE_ACCOUNT secret is missing or empty. Running in"
-      " dry-run mode."
+      "[INFO] No FIREBASE_SERVICE_ACCOUNT secret detected. Running dry-run scan."
   )
 
-# Core liquid PSE issues
+# Core Philippine Stock Exchange issues
 PSE_TICKERS = [
     "ALI.PS",
     "BDO.PS",
@@ -48,78 +46,105 @@ PSE_TICKERS = [
 ]
 
 
-def send_alert(ticker, zone, price, level, rsi):
-  clean_ticker = ticker.replace(".PS", "")
-  action_text = (
-      "Accumulation Zone (Support)"
-      if zone == "BUY"
-      else "Profit-Taking Zone (Resistance)"
-  )
-  title = f"📊 PSE Alert: {clean_ticker}"
-  body = f"{clean_ticker} entered {action_text} at ₱{price:.2f}. Ref Level: ₱{level:.2f}, RSI: {rsi:.1f}."
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+  """Computes Relative Strength Index (RSI) using pure pandas."""
+  delta = series.diff()
+  gain = delta.where(delta > 0, 0.0)
+  loss = -delta.where(delta < 0, 0.0)
+  avg_gain = gain.rolling(window=period, min_periods=period).mean()
+  avg_loss = loss.rolling(window=period, min_periods=period).mean()
+  rs = avg_gain / avg_loss
+  return 100 - (100 / (1 + rs))
 
-  print(f"[TRIGGER] {title} - {body}")
+
+def dispatch_zone_alert(
+    ticker: str, zone_type: str, price: float, level: float, rsi: float
+):
+  """Dispatches alert to Firebase topic if configured."""
+  clean_sym = ticker.replace(".PS", "")
+  zone_label = (
+      "Accumulation Zone (Near Support)"
+      if zone_type == "BUY"
+      else "Profit-Taking Zone (Near Resistance)"
+  )
+  title = f"📊 PSE Alert: {clean_sym}"
+  body = (
+      f"{clean_sym} entered {zone_label} at ₱{price:.2f}. Ref Level: ₱{level:.2f}"
+      f" | RSI: {rsi:.1f}. (Analytical reference only; not financial advice.)"
+  )
+
+  print(f"[TRIGGER] {title} -> {body}")
 
   if not firebase_ready:
-    print(
-        f"[SKIP] Firebase not configured. Did not dispatch alert for"
-        f" {clean_ticker}."
-    )
+    print(f"[DRY-RUN] Alert calculated for {clean_sym}, but push was skipped.")
     return
 
   try:
-    message = messaging.Message(
+    msg = messaging.Message(
         notification=messaging.Notification(title=title, body=body),
         topic="pse_alerts",
     )
-    response = messaging.send(message)
-    print(f"[DISPATCH] Successfully sent FCM message ID: {response}")
-  except Exception as e:
-    print(f"[ERROR] Failed to send push notification: {e}")
+    msg_id = messaging.send(msg)
+    print(f"[FCM SUCCESS] Message delivered with ID: {msg_id}")
+  except Exception as err:
+    print(f"[FCM ERROR] Failed sending notification for {clean_sym}: {err}")
 
 
-def run_scan():
-  print(f"[START] Beginning analysis across {len(PSE_TICKERS)} PSE tickers...")
+def run_market_scan():
+  print(f"[SCAN] Evaluating {len(PSE_TICKERS)} PSE issues...")
 
   for symbol in PSE_TICKERS:
     try:
-      stock = yf.Ticker(symbol)
-      df = stock.history(period="3mo")
+      ticker_obj = yf.Ticker(symbol)
+      df = ticker_obj.history(period="3mo")
 
-      if df.empty or len(df) < 30:
-        print(f"[DATA] Insufficient data returned for {symbol}. Skipping.")
+      if df.empty or len(df) < 25:
+        print(f"[-] {symbol}: Insufficient price data returned. Skipping.")
         continue
 
-      df["RSI"] = ta.rsi(df["Close"], length=14)
-      df["MA20"] = ta.sma(df["Close"], length=20)
-      df["MA50"] = ta.sma(df["Close"], length=50)
+      close_series = df["Close"]
+      df["MA20"] = close_series.rolling(window=20).mean()
+      df["MA50"] = close_series.rolling(window=50).mean()
+      df["RSI"] = calculate_rsi(close_series, period=14)
 
-      price = float(df["Close"].iloc[-1])
-      rsi = float(df["RSI"].iloc[-1])
-
-      support = float(df["Low"].tail(20).min())
-      resistance = float(df["High"].tail(20).max())
-
-      print(
-          f"[{symbol.replace('.PS', '')}] Price: ₱{price:.2f} | Support:"
-          f" ₱{support:.2f} | Resistance: ₱{resistance:.2f} | RSI: {rsi:.1f}"
+      curr_price = float(close_series.iloc[-1])
+      curr_rsi = (
+          float(df["RSI"].dropna().iloc[-1])
+          if not df["RSI"].dropna().empty
+          else 50.0
       )
 
-      # Analytical Buy / Accumulation Zone: Near support & non-overbought momentum
-      if support * 0.98 <= price <= support * 1.02 and rsi <= 50:
-        send_alert(symbol, "BUY", price, support, rsi)
+      # 20-day Support (lowest price) & Resistance (highest price)
+      support_level = float(df["Low"].tail(20).min())
+      resist_level = float(df["High"].tail(20).max())
 
-      # Analytical Sell / Profit-Taking Zone: Near resistance & elevated momentum
-      elif resistance * 0.98 <= price <= resistance * 1.02 and rsi >= 60:
-        send_alert(symbol, "SELL", price, resistance, rsi)
+      print(
+          f"[DATA] {symbol.replace('.PS',''):<6} Price: ₱{curr_price:>7.2f} | "
+          f"Supp: ₱{support_level:>7.2f} | Res: ₱{resist_level:>7.2f} | "
+          f"RSI: {curr_rsi:>5.1f}"
+      )
 
-    except Exception as e:
-      print(f"[ERROR] Exception processing {symbol}: {e}")
+      # Buy/Accumulation Zone: Within 2% of Support and RSI <= 45
+      if (
+          support_level * 0.98 <= curr_price <= support_level * 1.02
+          and curr_rsi <= 45
+      ):
+        dispatch_zone_alert(symbol, "BUY", curr_price, support_level, curr_rsi)
 
-    time.sleep(0.5)
+      # Sell/Profit-Taking Zone: Within 2% of Resistance and RSI >= 65
+      elif (
+          resist_level * 0.98 <= curr_price <= resist_level * 1.02
+          and curr_rsi >= 65
+      ):
+        dispatch_zone_alert(symbol, "SELL", curr_price, resist_level, curr_rsi)
 
-  print("[FINISH] PSE stock scan complete.")
+    except Exception as stock_err:
+      print(f"[WARN] Error calculating {symbol}: {stock_err}")
+
+    time.sleep(0.3)
+
+  print("[SCAN] Completed all ticker evaluations.")
 
 
 if __name__ == "__main__":
-  run_scan()
+  run_market_scan()
